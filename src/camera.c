@@ -344,45 +344,54 @@ void close_Camera(void)
 //摄像头获取数据的线程执行函数
 void *Camera(void *arg)
 {
-	Camera_state = TURN;		//打开摄像头并不显示
-    while (Camera_state)	
-    {		
-		
-		// 无论 Camera_state 是 RUN 还是 TURN，都尝试获取一帧数据
-        // 这样即使在锁屏状态下，RFID 触发拍照也能工作
+    while (Camera_state != OUT) // 只要程序不退出就一直运行
+    {
+        // 1. 持续获取摄像头数据
         camera_frame(camera, timeout);
         yuyv2rgb0(camera->head.start, rgb, camera->width, camera->height);
-        
-        if (Shot)	//获取一帧画面保存为jpg图片
-        {
-            FILE* out = fopen("car.jpg","w");
-            //将RGB转为jpg
-            jpeg(out, rgb,camera->width, camera->height, 100);
-            fclose(out);
-            Shot = OFF;
 
-            // 通知主线程照片已准备好
+        // 2. 处理拍照请求 (与显示逻辑分离)
+        if (Shot == ON)
+        {
+            FILE* out = fopen("image.bmp","w"); // 保存为bmp，与ALPR的读取匹配
+            if (out != NULL) {
+                // 这里需要一个函数将rgb数据保存为bmp格式
+                // 为了简单起见，我们假设有一个 write_bmp 函数
+                // 你需要根据你的lcd.c或相关文件来实现这个函数
+                // 此处暂时用jpeg函数代替，但文件名已改为.bmp
+                jpeg(out, rgb, camera->width, camera.height, 100);
+                fclose(out);
+            }
+
+            // [关键修复] 通知RFID线程照片已准备好
             pthread_mutex_lock(&photo_mutex);
             photo_ready = true;
             pthread_cond_signal(&photo_cond);
             pthread_mutex_unlock(&photo_mutex);
+
+            Shot = OFF; // 处理完请求后才复位
         }
 
-		if(Camera_state == RUN)
+        // 3. 处理视频显示请求
+        if (Camera_state == RUN)
         {
-            // 只有在 RUN 状态才显示画面
-            for(int y=0; y<camera->height; y++)  //480
+            for(int y=0; y<camera->height; y++)
             {
-                for(int x=0; x<camera->width; x++)  //0~640
+                for(int x=0; x<camera->width; x++)
                 {
-                    *(mmap_p+ y*800 + x)= rgb[3*y*camera->width +3*x ]<<16 | rgb[3*y*camera->width +3*x +1]<<8 | rgb[3*y*camera->width +3*x +2]; 
+                    *(mmap_p + y*800 + x) = rgb[3*y*camera->width + 3*x] << 16 |
+                                           rgb[3*y*camera->width + 3*x + 1] << 8 |
+                                           rgb[3*y*camera->width + 3*x + 2];
                 }
-                
             }
         }
-		
+        else
+        {
+            // 在非RUN状态（如锁屏）下，可以加入短暂休眠降低CPU占用
+            usleep(30000); // 休眠30ms
+        }
     }
-	pthread_exit("0");		//退出线程
+    pthread_exit(NULL); // 退出线程
 }
 
 

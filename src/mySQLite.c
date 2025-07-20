@@ -190,6 +190,7 @@ void *fun_sqlite(void *arg)
                 printf("ALPR 识别失败 (入库)!\n");
                 play_audio("audio/recognition_failed.wav");
                 alpr_error_detected = 1;
+                alpr_response_received = true; // [修复] 通知RFID线程处理已完成
                 continue;
             }
 

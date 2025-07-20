@@ -130,25 +130,19 @@ void *rfid_thread(void *arg)
 
         printf("RFID: 授权卡 %s -> 车牌 %s\n", card_id_str, plate_number);
 
+        // 1. 触发拍照
         Shot = ON;
-        pthread_mutex_lock(&photo_mutex);
-        photo_ready = false;
-        pthread_mutex_unlock(&photo_mutex);
 
+        // 2. 等待摄像头线程完成拍照 (关键同步点)
         pthread_mutex_lock(&photo_mutex);
+        photo_ready = false; // 重置标志位
         while (!photo_ready) {
             pthread_cond_wait(&photo_cond, &photo_mutex);
         }
         pthread_mutex_unlock(&photo_mutex);
 
-        pthread_mutex_lock(&photo_mutex);
-        strncpy(g_rfid_plate, plate_number, sizeof(g_rfid_plate) - 1);
-        g_rfid_plate[sizeof(g_rfid_plate) - 1] = '\0';
-        g_is_rfid_triggered = true;
-        pthread_mutex_unlock(&photo_mutex);
-        
-        usleep(500000); // 等待半秒，确保摄像头数据稳定
-        printf("RFID: 发送统一识别信号给ALPR进程...\n");
+        // 3. [在照片准备好之后] 发送识别信号给ALPR进程
+        printf("RFID: 照片已生成, 发送识别信号给ALPR进程...\n");
         if (kill(alpr_pid, SIGUSR1) == -1) {
             perror("RFID: 发送信号失败");
         } else {
