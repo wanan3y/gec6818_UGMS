@@ -359,7 +359,7 @@ void *Camera(void *arg)
                 // 为了简单起见，我们假设有一个 write_bmp 函数
                 // 你需要根据你的lcd.c或相关文件来实现这个函数
                 // 此处暂时用jpeg函数代替，但文件名已改为.bmp
-                jpeg(out, rgb, camera->width, camera.height, 100);
+                jpeg(out, rgb, camera->width, camera->height, 100);
                 fclose(out);
             }
 
