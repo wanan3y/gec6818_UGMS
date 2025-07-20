@@ -12,13 +12,17 @@
 #include <time.h>
 #include <stdio.h>
 #include <string.h> // 确保包含了 string.h 用于 memset 和 strcmp
+#include <errno.h> // 添加 errno.h 用于错误检查
 
 // [全局变量定义] 用于RFID与摄像头联动验证
 char g_rfid_plate[20] = {0}; // 存储由RFID刷卡触发的、期望操作的车牌号
 volatile bool g_is_rfid_triggered = false; // 标志位，用于指示当前操作是否由RFID触发
 volatile bool g_suppress_bmp_output = false; // [新增] 默认不抑制BMP输出
 
+
+
 volatile int alpr_error_detected = 0; // ALPR 错误检测标志位
+volatile bool alpr_response_received = false; // ALPR响应标志位
 
 // ================= 全局变量定义 =================
 int lcd_fd;         // LCD 文件描述符
@@ -65,8 +69,8 @@ extern int Camera_state;
 extern int Shot;
 
 // 外部函数声明 (通常在头文件中，但为确保完整性在此列出)
-// void lcd_init(void);
-// void show_bmp_any(const char *pathname, int x, int y);
+// void lcd_init(void);  // 已在lcd.h中声明
+// void show_bmp_any(const char *pathname, int x, int y);  // 已在lcd.h中声明
 void close_lcd(void);
 void init_touch(void);
 void close_touch(void);
@@ -143,28 +147,29 @@ void *rfid_thread(void *arg)
         g_is_rfid_triggered = true;
         pthread_mutex_unlock(&photo_mutex);
         
-usleep(500000); // 等待半秒，确保摄像头数据稳定
+        usleep(500000); // 等待半秒，确保摄像头数据稳定
         printf("RFID: 发送统一识别信号给ALPR进程...\n");
-        // 添加信号发送后的错误检查
-        if (kill(alpr_pid, SIGRTMIN) == -1) {
-        perror("RFID: 发送信号失败");
+        if (kill(alpr_pid, SIGUSR1) == -1) {
+            perror("RFID: 发送信号失败");
         } else {
-        // 等待ALPR处理完成（最长等待5秒）
-        int timeout = 0;
-        while (alpr_error_detected == 0 && timeout < 50) {
-        usleep(100000); // 等待100ms
-        timeout++;
+            // 重置标志位，准备等待ALPR响应
+            alpr_response_received = false;
+            // 等待ALPR处理完成（最长等待5秒）
+            int timeout = 0;
+            while (!alpr_response_received && timeout < 50) {
+                usleep(100000); // 等待100ms
+                timeout++;
+            }
+            if (!alpr_response_received) {
+                printf("RFID: ALPR处理超时\n");
+                play_audio("audio/timeout.wav");
+            }
         }
-        if (timeout >= 50) {
-        printf("RFID: ALPR处理超时\n");
-        play_audio("audio/timeout.wav");
-        }
-        }
-        sleep(3);
     }
     close_tty();
     return NULL;
 }
+
 
 
 // 密码验证函数
@@ -173,25 +178,11 @@ bool verify_password(const char *input)
     return strcmp(input, "2580") == 0;
 }
 
-// 显示密码函数
+// 显示密码函数 - 暂时不显示任何内容
 void display_password(int input_count, const char *password_input)
 {
-    for (int i = 0; i < 4; i++) {
-        // 在(200+i*80, 300)位置显示黑色背景以清除旧内容
-        for (int y = 300; y < 380; y++) {
-            for (int x = 200 + i*80; x < 280 + i*80; x++) { // 区域宽度调整为100
-                 if(y*800 + x < 800*480) mmap_p[y*800 + x] = 0x000000;
-            }
-        }
-        // 显示星号或者数字
-        if (i < input_count) {
-             // 可以在此处显示星号图片 "asterisk.bmp" 来隐藏密码
-             // 或者像原来一样显示数字
-            char bmp_path[32];
-            snprintf(bmp_path, sizeof(bmp_path), "fonts/%d.bmp", password_input[i] - '0');
-            show_bmp_any(bmp_path, 210 + i*80, 300); // 调整位置使其居中
-        }
-    }
+    // 暂时不显示密码输入区域，改为上滑解锁
+    // 可以在这里添加提示文字或其他界面元素
 }
 
 // 主函数
@@ -201,10 +192,26 @@ int main(int argc, char const *argv[])
     // if (remove("parking.db") == 0) {
     // 修改数据库删除路径
     // if (remove("/mnt/hgfs/qrsgx/18/Car1/parking.db") == 0) {
-    if (remove("/mnt/udisk/Carsystem/parking.db") == 0) {
-        printf("[系统初始化]: 旧数据库 parking.db 已成功删除。\n");
-    } else {
-        perror("[系统初始化警告]: 删除 parking.db 失败");
+    printf("[系统初始化]: 尝试删除数据库文件 /mnt/udisk/Carsystem/parking.db\n");
+    
+    // 删除数据库文件及其相关文件（WAL、SHM等）
+    const char *db_files[] = {
+        "/mnt/udisk/Carsystem/parking.db",
+        "/mnt/udisk/Carsystem/parking.db-wal",
+        "/mnt/udisk/Carsystem/parking.db-shm",
+        "/mnt/udisk/Carsystem/parking.db-journal"
+    };
+    
+    for (int i = 0; i < 4; i++) {
+        if (access(db_files[i], F_OK) == 0) {
+            printf("[系统初始化]: 删除文件: %s\n", db_files[i]);
+            if (remove(db_files[i]) == 0) {
+                printf("[系统初始化]: 文件 %s 删除成功\n", db_files[i]);
+            } else {
+                perror("[系统初始化警告]: 删除文件失败");
+                printf("[系统初始化]: 错误代码: %d\n", errno);
+            }
+        }
     }
 
     program_running = 1;
@@ -262,61 +269,55 @@ int main(int argc, char const *argv[])
 
     while(program_running)
     {
-        // Camera_state = TURN;
-        // show_bmp_any("ui/lock_screen.bmp", 0, 0); // 假设UI图片在ui目录下
-        // printf("已进入锁屏界面。输入密码解锁，下滑退出...\n");
+        // 显示锁屏界面
+        Camera_state = TURN;
+        show_bmp_any("ui/lock_screen.bmp", 0, 0);
+        printf("已进入锁屏界面。上滑解锁，下滑退出...\n");
         
-        // input_count = 0;
-        // memset(password_input, 0, sizeof(password_input));
-        // display_password(input_count, password_input);
+        // 初始化密码输入
+        input_count = 0;
+        memset(password_input, 0, sizeof(password_input));
+        display_password(input_count, password_input);
 
-        // int locked = 1;
-        // while(locked && program_running)
-        // {
-        //     fd_set rdfs;
-        //     FD_ZERO(&rdfs);
-        //     FD_SET(touch_fd, &rdfs);
-        //     struct timeval timeout = {1, 0};
+        // 锁屏循环 - 改为上滑解锁
+        int locked = 1;
+        while(locked && program_running)
+        {
+            fd_set rdfs;
+            FD_ZERO(&rdfs);
+            FD_SET(touch_fd, &rdfs);
+            struct timeval timeout = {1, 0};
 
-        //     int ret = select(touch_fd + 1, &rdfs, NULL, NULL, &timeout);
-        //     if (ret > 0 && FD_ISSET(touch_fd, &rdfs)) {
-        //         int action = get_slide_xy(&x, &y);
-        //         if (action == 2) // 假设 get_slide_xy 返回 2 代表下滑
-        //         {
-        //             printf("收到退出指令...\n");
-        //             program_running = 0;
-        //             locked = 0;
-        //         }
-        //         // 简化密码键盘区域判断
-        //         else if (y > 280 && y < 460) // 大致的密码输入区
-        //         {
-        //              // 此处应根据你的 lock_screen.bmp 上的键盘布局精确计算按下的键
-        //              // 以下是一个示例逻辑
-        //             if (input_count < 4) {
-        //                 // password_input[input_count++] = '0' + calculated_digit;
-        //                 // display_password(input_count, password_input);
-        //             }
-        //         }
-        //         else if (x > 300 && y > 460) // 假设确认键位置
-        //         {
-        //             if (verify_password(password_input)) {
-        //                 play_audio("audio/unlock_success.wav");
-        //                 locked = 0;
-        //                 last_activity_time = time(NULL);
-        //             } else {
-        //                 play_audio("audio/unlock_failed.wav");
-        //                 input_count = 0;
-        //                 memset(password_input, 0, sizeof(password_input));
-        //                 display_password(input_count, password_input);
-        //             }
-        //         }
-        //     }
-        // }
+            int ret = select(touch_fd + 1, &rdfs, NULL, NULL, &timeout);
+            if (ret > 0 && FD_ISSET(touch_fd, &rdfs)) {
+                int action = get_slide_xy(&x, &y);
+                if (action == DOWN) // 下滑退出
+                {
+                    printf("收到退出指令...\n");
+                    program_running = 0;
+                    locked = 0;
+                }
+                else if (action == UP) // 上滑解锁
+                {
+                    printf("检测到上滑解锁手势，进入主界面...\n");
+                    locked = 0;
+                    last_activity_time = time(NULL);
+                }
+                // 保留点击解锁作为备用方案
+                else if (x > 300 && y > 400 && x < 500 && y < 480) // 临时解锁区域
+                {
+                    printf("临时解锁区域被点击，进入主界面...\n");
+                    locked = 0;
+                    last_activity_time = time(NULL);
+                }
+            }
+        }
 
-        // if (!program_running) {
-        //     continue;
-        // }
+        if (!program_running) {
+            continue;
+        }
 
+        // 显示主功能界面
         Camera_state = RUN;
         show_bmp_any("ui/car_input.bmp", 640, 0);
         show_bmp_any("ui/car_output.bmp", 640, 160);

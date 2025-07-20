@@ -4,6 +4,7 @@
 
 extern void play_audio(const char *audio_path); // 声明 play_audio 函数
 extern volatile int alpr_error_detected; // 声明 ALPR 错误检测标志位
+extern volatile bool alpr_response_received; // 声明 ALPR 响应标志位
 extern int Camera_state; // 声明 Camera_state 变量
 
 bool first = true;
@@ -20,6 +21,8 @@ int fifoOut;
 // col_name: 每一列的名称（标题)
 int showDB(void *arg, int len, char **col_val, char **col_name)
 {
+    printf("[DEBUG]: showDB被调用，len=%d\n", len);
+    
     // 显示标题(只显示一次)
     if(first)
     {
@@ -47,8 +50,9 @@ int showDB(void *arg, int len, char **col_val, char **col_name)
 
 int checEmpty(void *arg, int len, char **col_val, char **col_name)
 {
-	if(arg != NULL)
-		(*(int *)arg)++;
+	printf("[DEBUG]: checEmpty被调用，len=%d, col_val[0]=%s\n", len, col_val[0]);
+	if(arg != NULL && col_val[0] != NULL)
+		(*(int *)arg) = atoi(col_val[0]); // 将字符串转换为整数并赋值
 	return 0;
 }
 
@@ -80,8 +84,15 @@ int is_car_in_db(const char *plate_num)
     char SQL[100];
     int count = 0;
     snprintf(SQL, 100, "SELECT COUNT(*) FROM info WHERE 车牌='%s';", plate_num);
-    sqlite3_exec(db, SQL, checEmpty, &count, &err);
-    printf("DEBUG: is_car_in_db(%s) returned %d\n", plate_num, count > 0);
+    printf("[DEBUG]: 执行SQL查询: %s\n", SQL);
+    int result = sqlite3_exec(db, SQL, checEmpty, &count, &err);
+    if (result != SQLITE_OK) {
+        printf("[DEBUG]: SQL查询失败: %s\n", err);
+        sqlite3_free(err);
+        err = NULL;
+        return 0;
+    }
+    printf("DEBUG: is_car_in_db(%s) returned %d (count=%d)\n", plate_num, count > 0, count);
     return count > 0;
 }
 
@@ -110,15 +121,38 @@ void *fun_sqlite(void *arg)
     // 3. 打开或创建数据库
     // 修改数据库打开路径
     // int ret = sqlite3_open_v2("/mnt/hgfs/qrsgx/18/Car1/parking.db", &db, ...);
+    printf("[SQLite]: 尝试打开/创建数据库: /mnt/udisk/Carsystem/parking.db\n");
     int ret = sqlite3_open_v2("/mnt/udisk/Carsystem/parking.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     if(ret != SQLITE_OK) {
         printf("创建/打开数据库失败: %s\n", sqlite3_errmsg(db));
+        printf("[SQLite]: 错误代码: %d\n", ret);
         pthread_exit(NULL);
+    } else {
+        printf("[SQLite]: 数据库打开/创建成功\n");
     }
 
     // 4. 创建车辆信息表 (如果不存在)
     // 4. 创建车辆信息表 (如果不存在), 注意：时间字段必须为INTEGER类型
-    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS info (车牌 TEXT PRIMARY KEY, 时间 INTEGER);", NULL, NULL, &err);
+    int create_result = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS info (车牌 TEXT PRIMARY KEY, 时间 INTEGER);", NULL, NULL, &err);
+    if (create_result != SQLITE_OK) {
+        printf("[DEBUG]: 创建表失败: %s\n", err);
+        sqlite3_free(err);
+        err = NULL;
+    } else {
+        printf("[DEBUG]: 表创建成功\n");
+    }
+
+    // 测试查询，确保数据库正常工作
+    printf("[DEBUG]: 测试数据库查询...\n");
+    int count = 0;
+    int test_result = sqlite3_exec(db, "SELECT COUNT(*) FROM info;", checEmpty, &count, &err);
+    if (test_result != SQLITE_OK) {
+        printf("[DEBUG]: 测试查询失败: %s\n", err);
+        sqlite3_free(err);
+        err = NULL;
+    } else {
+        printf("[DEBUG]: 测试查询成功，当前数据库中有 %d 条记录\n", count);
+    }
 
     printf("[SQLite 准备就绪]，等待车牌信息...\n");
 
@@ -162,15 +196,28 @@ void *fun_sqlite(void *arg)
             // 只要车牌已在库，提示并return，不再自动出库
             if (is_car_in_db(carplate)) {
                 printf("车辆 %s 已在库，入库操作忽略。\n", carplate);
+                printf("[DEBUG]: 当前数据库中的所有车辆:\n");
+                first = true;
+                int query_result = sqlite3_exec(db, "SELECT * FROM info;", showDB, NULL, &err);
+                if (query_result != SQLITE_OK) {
+                    printf("[DEBUG]: 查询数据库失败: %s\n", err);
+                    sqlite3_free(err);
+                    err = NULL;
+                } else {
+                    printf("[DEBUG]: 数据库查询成功，显示完成\n");
+                }
                 play_audio("audio/car_already_in.wav"); // 可选
+                alpr_response_received = true; // 即使车辆已在库，也要通知RFID线程
                 continue;
             }
             // 车辆不在库，执行入库流程
             printf("车辆 %s 不在库，执行入库流程...\n", carplate);
             snprintf(SQL, sizeof(SQL), "INSERT INTO info (车牌, 时间) VALUES ('%s', %ld);", carplate, time(NULL));
-            sqlite3_exec(db, SQL, NULL, NULL, &err);
-            if (err != SQLITE_OK) {
+            printf("[DEBUG]: 执行入库SQL: %s\n", SQL);
+            int insert_result = sqlite3_exec(db, SQL, NULL, NULL, &err);
+            if (insert_result != SQLITE_OK) {
                 printf("数据库插入失败: %s\n", err);
+                printf("[DEBUG]: 插入错误代码: %d\n", insert_result);
                 sqlite3_free(err); err = NULL;
             } else {
                 printf("车辆 %s 入库成功！\n", carplate);
@@ -180,6 +227,7 @@ void *fun_sqlite(void *arg)
             // 无论出入库，都显示一下当前车库情况
             first = true; // 允许下次打印表格头
             sqlite3_exec(db, "SELECT * FROM info;", showDB, NULL, &err);
+            alpr_response_received = true; // 设置响应标志
         }
 
         // ======== 处理手动出库请求(此逻辑保留，以防万一) ========
