@@ -344,37 +344,43 @@ void close_Camera(void)
 //摄像头获取数据的线程执行函数
 void *Camera(void *arg)
 {
-    while (Camera_state != OUT) // 只要程序不退出就一直运行
+    // 线程启动时，摄像头状态由主线程设置
+    while (Camera_state != OUT)
     {
-        // 1. 持续获取摄像头数据
+        // 无论 Camera_state 是 RUN 还是 TURN，都尝试获取一帧数据
+        // 这样即使在锁屏状态下，RFID 触发拍照也能工作
         camera_frame(camera, timeout);
-        yuyv2rgb0(camera->head.start, rgb, camera->width, camera->height);
 
-        // 2. 处理拍照请求 (与显示逻辑分离)
+        // 只有在需要显示或者需要拍照时，才进行消耗资源的格式转换
+        if (Camera_state == RUN || Shot == ON)
+        {
+            yuyv2rgb0(camera->head.start, rgb, camera->width, camera->height);
+        }
+
         if (Shot == ON)
         {
-            FILE* out = fopen("image.bmp","w"); // 保存为bmp，与ALPR的读取匹配
+            FILE* out = fopen("image.bmp","w");
             if (out != NULL) {
-                // 这里需要一个函数将rgb数据保存为bmp格式
-                // 为了简单起见，我们假设有一个 write_bmp 函数
-                // 你需要根据你的lcd.c或相关文件来实现这个函数
-                // 此处暂时用jpeg函数代替，但文件名已改为.bmp
+                // 此处需要一个将RGB数据写入BMP文件的函数。
+                // 暂时使用jpeg函数作为替代实现，但文件名是.bmp
                 jpeg(out, rgb, camera->width, camera->height, 100);
                 fclose(out);
             }
 
-            // [关键修复] 通知RFID线程照片已准备好
+            // [关键修复] 使用互斥锁确保信号只发一次且状态正确
             pthread_mutex_lock(&photo_mutex);
-            photo_ready = true;
-            pthread_cond_signal(&photo_cond);
+            if (photo_ready == false) { // 避免重复发信号
+                photo_ready = true;
+                pthread_cond_signal(&photo_cond);
+            }
             pthread_mutex_unlock(&photo_mutex);
 
-            Shot = OFF; // 处理完请求后才复位
+            Shot = OFF; // 完成后复位
         }
 
-        // 3. 处理视频显示请求
         if (Camera_state == RUN)
         {
+            // 在RUN状态下显示画面
             for(int y=0; y<camera->height; y++)
             {
                 for(int x=0; x<camera->width; x++)
@@ -387,11 +393,11 @@ void *Camera(void *arg)
         }
         else
         {
-            // 在非RUN状态（如锁屏）下，可以加入短暂休眠降低CPU占用
+            // 在非RUN状态下（如锁屏），短暂休眠以释放CPU
             usleep(30000); // 休眠30ms
         }
     }
-    pthread_exit(NULL); // 退出线程
+    pthread_exit(NULL);
 }
 
 
