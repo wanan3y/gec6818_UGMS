@@ -380,10 +380,7 @@ void *Camera(void *arg)
                 
             }
         }
-
-        // [最终修复] 在每次循环后强制休眠，将CPU时间让给UI主线程
-        usleep(30000); // 休眠30毫秒，确保UI响应
-		
+		usleep(30000); // 强制休眠，确保UI线程获得CPU时间
     }
 	pthread_exit("0");		//退出线程
 }

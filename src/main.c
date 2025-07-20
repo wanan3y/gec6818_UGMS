@@ -130,38 +130,39 @@ void *rfid_thread(void *arg)
 
         printf("RFID: 授权卡 %s -> 车牌 %s\n", card_id_str, plate_number);
 
-        // [最终修复] 使用带超时的等待，确保RFID线程不会被永久阻塞
-        struct timespec timeout;
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        timeout.tv_sec = now.tv_sec + 3; // 设置3秒超时
-        timeout.tv_nsec = now.tv_usec * 1000;
-
+        Shot = ON;
         pthread_mutex_lock(&photo_mutex);
-        photo_ready = false; // 每次等待前重置标志位
-        int wait_ret = pthread_cond_timedwait(&photo_cond, &photo_mutex, &timeout);
+        photo_ready = false;
         pthread_mutex_unlock(&photo_mutex);
 
-        if (wait_ret == ETIMEDOUT) {
-            printf("RFID: 等待摄像头拍照超时，自动重置...\n");
-            Shot = OFF; // 如果超时，确保重置拍照标志
-            continue; // 跳过本次后续流程，直接准备下一次刷卡
+        pthread_mutex_lock(&photo_mutex);
+        while (!photo_ready) {
+            pthread_cond_wait(&photo_cond, &photo_mutex);
         }
+        pthread_mutex_unlock(&photo_mutex);
 
-        // 如果拍照成功，才继续后续流程
-        printf("RFID: 拍照完成，发送识别信号...\n");
+        pthread_mutex_lock(&photo_mutex);
+        strncpy(g_rfid_plate, plate_number, sizeof(g_rfid_plate) - 1);
+        g_rfid_plate[sizeof(g_rfid_plate) - 1] = '\0';
+        g_is_rfid_triggered = true;
+        pthread_mutex_unlock(&photo_mutex);
+        
+usleep(500000); // 等待半秒，确保摄像头数据稳定
+        printf("RFID: 发送统一识别信号给ALPR进程...\n");
         if (kill(alpr_pid, SIGUSR1) == -1) {
             perror("RFID: 发送信号失败");
         } else {
-            // 等待ALPR响应 (这个等待也应该有超时，但我们先解决主要矛盾)
+            // 重置标志位，准备等待ALPR响应
             alpr_response_received = false;
-            int alpr_timeout = 0;
-            while (!alpr_response_received && alpr_timeout < 20) { // 2秒等待
-                usleep(100000);
-                alpr_timeout++;
+            // 等待ALPR处理完成（最长等待5秒）
+            int timeout = 0;
+            while (!alpr_response_received && timeout < 50) {
+                usleep(100000); // 等待100ms
+                timeout++;
             }
             if (!alpr_response_received) {
-                printf("RFID: 等待ALPR响应超时。\n");
+                printf("RFID: ALPR处理超时\n");
+                play_audio("audio/timeout.wav");
             }
         }
     }

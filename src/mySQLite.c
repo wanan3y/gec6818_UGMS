@@ -190,25 +190,15 @@ void *fun_sqlite(void *arg)
                 printf("ALPR 识别失败 (入库)!\n");
                 play_audio("audio/recognition_failed.wav");
                 alpr_error_detected = 1;
-                alpr_response_received = true; // [修复] 通知RFID线程处理已完成
+                alpr_response_received = true; // [修复] 通知RFID线程，让其解除阻塞
                 continue;
             }
 
             // 只要车牌已在库，提示并return，不再自动出库
             if (is_car_in_db(carplate)) {
                 printf("车辆 %s 已在库，入库操作忽略。\n", carplate);
-                printf("[DEBUG]: 当前数据库中的所有车辆:\n");
-                first = true;
-                int query_result = sqlite3_exec(db, "SELECT * FROM info;", showDB, NULL, &err);
-                if (query_result != SQLITE_OK) {
-                    printf("[DEBUG]: 查询数据库失败: %s\n", err);
-                    sqlite3_free(err);
-                    err = NULL;
-                } else {
-                    printf("[DEBUG]: 数据库查询成功，显示完成\n");
-                }
                 play_audio("audio/car_already_in.wav"); // 可选
-                alpr_response_received = true; // 即使车辆已在库，也要通知RFID线程
+                alpr_response_received = true; // [修复] 通知RFID线程，让其解除阻塞
                 continue;
             }
             // 车辆不在库，执行入库流程
