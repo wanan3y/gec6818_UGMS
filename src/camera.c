@@ -119,7 +119,7 @@ void camera_init(camera_t* camera)
           quit("VIDIOC_QUERYBUF");
         if (buf.length > buf_max) buf_max = buf.length;
         camera->buffers[i].length = buf.length;
-        camera->buffers[i].start =
+        camera->buffers[i].start = \
 		mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,camera->fd, buf.m.offset);
         if (camera->buffers[i].start == MAP_FAILED) quit("mmap");
   	}
@@ -344,60 +344,46 @@ void close_Camera(void)
 //摄像头获取数据的线程执行函数
 void *Camera(void *arg)
 {
-    // 线程启动时，摄像头状态由主线程设置
-    while (Camera_state != OUT)
-    {
-        // 无论 Camera_state 是 RUN 还是 TURN，都尝试获取一帧数据
+	Camera_state = TURN;		//打开摄像头并不显示
+    while (Camera_state)	
+    {		
+		
+		// 无论 Camera_state 是 RUN 还是 TURN，都尝试获取一帧数据
         // 这样即使在锁屏状态下，RFID 触发拍照也能工作
         camera_frame(camera, timeout);
-
-        // 只有在需要显示或者需要拍照时，才进行消耗资源的格式转换
-        if (Camera_state == RUN || Shot == ON)
+        yuyv2rgb0(camera->head.start, rgb, camera->width, camera->height);
+        
+        if (Shot)	//获取一帧画面保存为jpg图片
         {
-            yuyv2rgb0(camera->head.start, rgb, camera->width, camera->height);
-        }
+            FILE* out = fopen("car.jpg","w");
+            //将RGB转为jpg
+            jpeg(out, rgb,camera->width, camera->height, 100);
+            fclose(out);
+            Shot = OFF;
 
-        if (Shot == ON)
-        {
-            FILE* out = fopen("image.bmp","w");
-            if (out != NULL) {
-                // 此处需要一个将RGB数据写入BMP文件的函数。
-                // 暂时使用jpeg函数作为替代实现，但文件名是.bmp
-                jpeg(out, rgb, camera->width, camera->height, 100);
-                fclose(out);
-            }
-
-            // [关键修复] 使用互斥锁确保信号只发一次且状态正确
+            // 通知主线程照片已准备好
             pthread_mutex_lock(&photo_mutex);
-            if (photo_ready == false) { // 避免重复发信号
-                photo_ready = true;
-                pthread_cond_signal(&photo_cond);
-            }
+            photo_ready = true;
+            pthread_cond_signal(&photo_cond);
             pthread_mutex_unlock(&photo_mutex);
-
-            Shot = OFF; // 完成后复位
         }
 
-        if (Camera_state == RUN)
+		if(Camera_state == RUN)
         {
-            // 在RUN状态下显示画面
-            for(int y=0; y<camera->height; y++)
+            // 只有在 RUN 状态才显示画面
+            for(int y=0; y<camera->height; y++)  //480
             {
-                for(int x=0; x<camera->width; x++)
+                for(int x=0; x<camera->width; x++)  //0~640
                 {
-                    *(mmap_p + y*800 + x) = rgb[3*y*camera->width + 3*x] << 16 |
-                                           rgb[3*y*camera->width + 3*x + 1] << 8 |
-                                           rgb[3*y*camera->width + 3*x + 2];
+                    *(mmap_p+ y*800 + x)= rgb[3*y*camera->width +3*x ]<<16 | rgb[3*y*camera->width +3*x +1]<<8 | rgb[3*y*camera->width +3*x +2]; 
                 }
+                
             }
         }
-        else
-        {
-            // 在非RUN状态下（如锁屏），短暂休眠以释放CPU
-            usleep(30000); // 休眠30ms
-        }
+
+        // [最终修复] 在每次循环后强制休眠，将CPU时间让给UI主线程
+        usleep(30000); // 休眠30毫秒，确保UI响应
+		
     }
-    pthread_exit(NULL);
+	pthread_exit("0");		//退出线程
 }
-
-
