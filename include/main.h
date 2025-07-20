@@ -58,6 +58,9 @@ pthread_mutex_t photo_mutex;
 pthread_cond_t photo_cond;
 volatile bool photo_ready;
 
+pthread_mutex_t alpr_mutex; // ALPR响应互斥锁
+pthread_cond_t alpr_cond;   // ALPR响应条件变量
+
 // [新增] RFID与摄像头联动验证的全局变量 (extern声明)
 extern char g_rfid_plate[20];
 extern volatile bool g_is_rfid_triggered;

@@ -14,6 +14,11 @@
 #include <string.h> // 确保包含了 string.h 用于 memset 和 strcmp
 #include <errno.h> // 添加 errno.h 用于错误检查
 
+// [FIX] 为数据库就绪状态添加外部声明
+extern pthread_mutex_t db_ready_mutex;
+extern pthread_cond_t db_ready_cond;
+extern volatile bool db_is_ready;
+
 // [全局变量定义] 用于RFID与摄像头联动验证
 char g_rfid_plate[20] = {0}; // 存储由RFID刷卡触发的、期望操作的车牌号
 volatile bool g_is_rfid_triggered = false; // 标志位，用于指示当前操作是否由RFID触发
@@ -81,17 +86,28 @@ void *Camera(void *arg);
 void init_tty(void);
 void close_tty(void);
 int get_cardid(void);
-void *fun_sqlite(void *arg);
+// void *fun_sqlite(void *arg); // [FIX] 删除，此声明已在 mySQLite.h 中
 
 
 // 辅助函数：播放音频文件
 void play_audio(const char *audio_path)
 {
-    char command[256];
-    snprintf(command, sizeof(command), "aplay -q %s &", audio_path); // 使用 -q 静音模式并在后台播放
-    printf("尝试播放音频: %s\n", audio_path);
-    system(command);
-    usleep(100000); // 添加短暂延迟，避免设备忙碌
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork for aplay failed");
+        return;
+    } else if (pid == 0) {
+        // 子进程
+        char command[256];
+        snprintf(command, sizeof(command), "aplay -q %s", audio_path); // 不再使用 &，因为子进程会立即退出
+        execlp("aplay", "aplay", "-q", (char *)audio_path, NULL);
+        perror("execlp aplay failed"); // 如果execlp失败
+        _exit(1); // 子进程退出
+    } else {
+        // 父进程，不等待子进程
+        // printf("尝试播放音频: %s\n", audio_path);
+        // usleep(100000); // 添加短暂延迟，避免设备忙碌
+    }
 }
 
 // RFID 线程函数
@@ -99,6 +115,18 @@ void *rfid_thread(void *arg)
 {
     init_tty(); // 初始化串口
     printf("RFID 线程已启动，等待授权卡片...\n");
+
+    // [FIX] 等待数据库线程准备就绪
+    pthread_mutex_lock(&db_ready_mutex);
+    while (!db_is_ready) {
+        pthread_cond_wait(&db_ready_cond, &db_ready_mutex);
+    }
+    pthread_mutex_unlock(&db_ready_mutex);
+
+    if (db == NULL) {
+        printf("RFID: 检测到数据库未就绪，线程退出。\n");
+        return NULL;
+    }
 
     while(program_running) // 使用全局标志位控制循环
     {
@@ -130,39 +158,100 @@ void *rfid_thread(void *arg)
 
         printf("RFID: 授权卡 %s -> 车牌 %s\n", card_id_str, plate_number);
 
-        Shot = ON;
-        pthread_mutex_lock(&photo_mutex);
-        photo_ready = false;
-        pthread_mutex_unlock(&photo_mutex);
+        // [FIX] 自动判断入库或出库
+        if (is_car_in_db(plate_number)) {
+            // 车辆在库，执行出库
+            printf("RFID: 车辆 %s 已在库，触发自动出库...\n", plate_number);
+            Shot = ON; // 触发拍照
 
-        pthread_mutex_lock(&photo_mutex);
-        while (!photo_ready) {
-            pthread_cond_wait(&photo_cond, &photo_mutex);
-        }
-        pthread_mutex_unlock(&photo_mutex);
-
-        pthread_mutex_lock(&photo_mutex);
-        strncpy(g_rfid_plate, plate_number, sizeof(g_rfid_plate) - 1);
-        g_rfid_plate[sizeof(g_rfid_plate) - 1] = '\0';
-        g_is_rfid_triggered = true;
-        pthread_mutex_unlock(&photo_mutex);
-        
-usleep(500000); // 等待半秒，确保摄像头数据稳定
-        printf("RFID: 发送统一识别信号给ALPR进程...\n");
-        if (kill(alpr_pid, SIGUSR1) == -1) {
-            perror("RFID: 发送信号失败");
-        } else {
-            // 重置标志位，准备等待ALPR响应
-            alpr_response_received = false;
-            // 等待ALPR处理完成（最长等待5秒）
-            int timeout = 0;
-            while (!alpr_response_received && timeout < 50) {
-                usleep(100000); // 等待100ms
-                timeout++;
+            // 等待拍照完成 (与入库逻辑相同)
+            pthread_mutex_lock(&photo_mutex);
+            photo_ready = false;
+            struct timespec ts_photo;
+            clock_gettime(CLOCK_REALTIME, &ts_photo);
+            ts_photo.tv_sec += 3;
+            int photo_wait_ret = 0;
+            while (!photo_ready && photo_wait_ret == 0) {
+                photo_wait_ret = pthread_cond_timedwait(&photo_cond, &photo_mutex, &ts_photo);
             }
-            if (!alpr_response_received) {
-                printf("RFID: ALPR处理超时\n");
-                play_audio("audio/timeout.wav");
+            pthread_mutex_unlock(&photo_mutex);
+            if (photo_wait_ret == ETIMEDOUT) {
+                printf("RFID: 等待摄像头拍照超时！(出库)\n");
+                Shot = OFF;
+                continue;
+            }
+
+            // 设置RFID联动标志 (与入库逻辑相同)
+            pthread_mutex_lock(&photo_mutex);
+            strncpy(g_rfid_plate, plate_number, sizeof(g_rfid_plate) - 1);
+            g_rfid_plate[sizeof(g_rfid_plate) - 1] = '\0';
+            g_is_rfid_triggered = true;
+            pthread_mutex_unlock(&photo_mutex);
+
+            // 发送出库信号给ALPR
+            printf("RFID: 照片已生成，发送出库识别信号给ALPR进程...\n");
+            kill(alpr_pid, SIGUSR2); // SIGUSR2用于出库
+
+        } else {
+            // 车辆不在库，执行入库
+            printf("RFID: 车辆 %s 不在库，触发自动入库...\n", plate_number);
+            // 1. 触发拍照
+            Shot = ON;
+
+            // 2. 等待摄像头线程完成拍照 (带超时)
+            pthread_mutex_lock(&photo_mutex);
+            photo_ready = false; // 重置标志位
+            struct timespec ts_photo;
+            clock_gettime(CLOCK_REALTIME, &ts_photo);
+            ts_photo.tv_sec += 3; // 3秒超时
+
+            int photo_wait_ret = 0;
+            while (!photo_ready && photo_wait_ret == 0) {
+                photo_wait_ret = pthread_cond_timedwait(&photo_cond, &photo_mutex, &ts_photo);
+            }
+            pthread_mutex_unlock(&photo_mutex);
+
+            if (photo_wait_ret == ETIMEDOUT) {
+                printf("RFID: 等待摄像头拍照超时！\n");
+                Shot = OFF; // 确保重置Shot标志
+                play_audio("audio/timeout.wav"); // 播放超时音频
+                continue; // 跳过本次流程，准备下一次刷卡
+            }
+
+            // 3. 拍照成功，设置RFID联动标志并发送信号给ALPR进程
+            pthread_mutex_lock(&photo_mutex);
+            strncpy(g_rfid_plate, plate_number, sizeof(g_rfid_plate) - 1);
+            g_rfid_plate[sizeof(g_rfid_plate) - 1] = '\0';
+            g_is_rfid_triggered = true;
+            pthread_mutex_unlock(&photo_mutex);
+            
+            // [FIX] 重构信号发送逻辑，入库使用 SIGUSR1
+            printf("RFID: 照片已生成，发送入库识别信号给ALPR进程...\n");
+            if (kill(alpr_pid, SIGUSR1) == -1) { // SIGUSR1用于入库
+                perror("RFID: 发送信号失败");
+            } else {
+                // 等待ALPR处理完成 (带超时，使用alpr_cond)
+                pthread_mutex_lock(&alpr_mutex);
+                struct timespec ts_alpr;
+                clock_gettime(CLOCK_REALTIME, &ts_alpr);
+                ts_alpr.tv_sec += 5; // 5秒超时
+
+                int alpr_wait_ret = 0;
+                while (!alpr_response_received && alpr_wait_ret == 0) {
+                    alpr_wait_ret = pthread_cond_timedwait(&alpr_cond, &alpr_mutex, &ts_alpr); // 使用alpr_cond和alpr_mutex
+                }
+                pthread_mutex_unlock(&alpr_mutex);
+
+                // [FIX 2/2] 清理重复的判断并增加超时后的标志重置
+                if (alpr_wait_ret == ETIMEDOUT) {
+                    printf("RFID: 等待ALPR处理超时!\n");
+                    fflush(stdout); // [DEBUG] 强制刷新输出缓冲区
+                    play_audio("audio/timeout.wav");
+                    // 超时后也应该重置联动标志，允许下一次刷卡
+                    pthread_mutex_lock(&photo_mutex);
+                    g_is_rfid_triggered = false; 
+                    pthread_mutex_unlock(&photo_mutex);
+                }
             }
         }
     }
@@ -221,6 +310,9 @@ int main(int argc, char const *argv[])
 
     pthread_mutex_init(&photo_mutex, NULL);
     pthread_cond_init(&photo_cond, NULL);
+
+    pthread_mutex_init(&alpr_mutex, NULL); // 初始化ALPR互斥锁
+    pthread_cond_init(&alpr_cond, NULL);   // 初始化ALPR条件变量
 
     lcd_init();
 
@@ -350,22 +442,30 @@ int main(int argc, char const *argv[])
                     if (y > 0 && y < 160)
                     {
                         printf("[按钮] 车辆入库被点击...\n");
+                        show_bmp_any("ruku2.bmp", 640, 0); // 显示按下状态
                         play_audio("audio/car_in_progress.wav");
                         Shot = ON;
                         // ... (省略重复的等待逻辑)
                         kill(alpr_pid, SIGUSR1);
+                        sleep(2);
+                        show_bmp_any("ui/car_input.bmp", 640, 0); // 恢复原始状态
                     }
                     else if (y > 160 && y < 320)
                     {
                         printf("[按钮] 车辆出库被点击...\n");
+                        show_bmp_any("chuku2.bmp", 640, 160); // 显示按下状态
                         play_audio("audio/car_out_progress.wav");
                         Shot = ON;
                         // ... (省略重复的等待逻辑)
                         kill(alpr_pid, SIGUSR2);
+                        sleep(2);
+                        show_bmp_any("ui/car_output.bmp", 640, 160); // 恢复原始状态
                     }
                     else if (y > 320 && y < 480)
                     {
                         printf("[按钮] 锁屏被点击...\n");
+                        show_bmp_any("suoping2.bmp", 640, 320); // 显示按下状态
+                        sleep(2);
                         in_menu = 0;
                     }
                 }

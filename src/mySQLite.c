@@ -1,17 +1,56 @@
 #include "mySQLite.h"
+#include "main.h"
 #include <math.h> // For ceil
 #include <time.h> // For localtime, strftime
+#include <sys/stat.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <fcntl.h>
 
-extern void play_audio(const char *audio_path); // 声明 play_audio 函数
-extern volatile int alpr_error_detected; // 声明 ALPR 错误检测标志位
-extern volatile bool alpr_response_received; // 声明 ALPR 响应标志位
-extern int Camera_state; // 声明 Camera_state 变量
 
-bool first = true;
-sqlite3 *db = NULL; // 数据库的操作句柄
-char *err;          // 报错信息
-int fifoIn;
-int fifoOut;
+// [FIX] 外部全局变量声明
+extern volatile int program_running;
+extern pthread_mutex_t alpr_mutex;
+extern pthread_cond_t alpr_cond;
+extern pthread_mutex_t photo_mutex;
+extern volatile bool g_is_rfid_triggered;
+extern char g_rfid_plate[20];
+extern volatile int alpr_error_detected;
+extern volatile bool alpr_response_received;
+extern void play_audio(const char *audio_path);
+
+
+// [FIX] 定义全局数据库句柄
+sqlite3 *db = NULL;
+static char *err = NULL;
+static int first = 1;
+
+// [FIX] 新增：用于通知其他线程数据库已准备就绪的条件变量
+pthread_mutex_t db_ready_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t db_ready_cond = PTHREAD_COND_INITIALIZER;
+volatile bool db_is_ready = false;
+
+// [FIX] 新增：确保目录存在的辅助函数
+int ensure_dir_exists(const char *path) {
+    struct stat st = {0};
+
+    // 检查目录是否存在
+    if (stat(path, &st) == -1) {
+        // 如果不存在，则创建它
+        if (mkdir(path, 0777) == -1 && errno != EEXIST) {
+            perror("创建目录失败");
+            return -1;
+        }
+        printf("[SQLite]: 目录 '%s' 创建成功\n", path);
+    }
+    return 0;
+}
 
 // 每当你使用SELECT得到N条记录时，就会自动调用N次以下函数
 // 参数：
@@ -100,6 +139,9 @@ int is_car_in_db(const char *plate_num)
 // 使用 select I/O 多路复用模型统一处理入库和出库请求
 void *fun_sqlite(void *arg)
 {
+    // [FIX] 恢复 fifo 管道初始化逻辑
+    int fifoIn, fifoOut;
+
     printf("[SQLite 线程启动成功]....\n");
 
     // 1. 确保管道文件存在
@@ -118,15 +160,31 @@ void *fun_sqlite(void *arg)
         pthread_exit(NULL);
     }
 
-    // 3. 打开或创建数据库
-    // 修改数据库打开路径
-    // int ret = sqlite3_open_v2("/mnt/hgfs/qrsgx/18/Car1/parking.db", &db, ...);
-    printf("[SQLite]: 尝试打开/创建数据库: /mnt/udisk/Carsystem/parking.db\n");
-    int ret = sqlite3_open_v2("/mnt/udisk/Carsystem/parking.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
-    if(ret != SQLITE_OK) {
-        printf("创建/打开数据库失败: %s\n", sqlite3_errmsg(db));
-        printf("[SQLite]: 错误代码: %d\n", ret);
-        pthread_exit(NULL);
+    // [FIX] 在打开数据库之前，确保目录存在
+    const char* db_dir = "/mnt/udisk/Carsystem";
+    if (ensure_dir_exists(db_dir) != 0) {
+        // 目录创建失败，无法继续
+        pthread_mutex_lock(&db_ready_mutex);
+        db_is_ready = true; // 标记为就绪以释放其他等待的线程
+        pthread_cond_broadcast(&db_ready_cond);
+        pthread_mutex_unlock(&db_ready_mutex);
+        return NULL;
+    }
+    
+    // 1. 打开或创建数据库
+    const char* db_path = "/mnt/udisk/Carsystem/parking.db";
+    printf("[SQLite]: 尝试打开/创建数据库: %s\n", db_path);
+    int rc = sqlite3_open(db_path, &db);
+    if (rc) {
+        fprintf(stderr, "创建/打开数据库失败: %s\n", sqlite3_errmsg(db));
+        printf("[SQLite]: 错误代码: %d\n", rc);
+        db = NULL; // 确保db为NULL
+        // 即使失败，也要通知其他线程可以继续（虽然它们会发现db是NULL）
+        pthread_mutex_lock(&db_ready_mutex);
+        db_is_ready = true;
+        pthread_cond_broadcast(&db_ready_cond);
+        pthread_mutex_unlock(&db_ready_mutex);
+        return NULL;
     } else {
         printf("[SQLite]: 数据库打开/创建成功\n");
     }
@@ -155,6 +213,12 @@ void *fun_sqlite(void *arg)
     }
 
     printf("[SQLite 准备就绪]，等待车牌信息...\n");
+
+    // [FIX] 通知其他线程，数据库已准备就绪
+    pthread_mutex_lock(&db_ready_mutex);
+    db_is_ready = true;
+    pthread_cond_broadcast(&db_ready_cond);
+    pthread_mutex_unlock(&db_ready_mutex);
 
     // 5. 主循环：使用 select 监听两个管道
     fd_set read_fds;
@@ -190,7 +254,11 @@ void *fun_sqlite(void *arg)
                 printf("ALPR 识别失败 (入库)!\n");
                 play_audio("audio/recognition_failed.wav");
                 alpr_error_detected = 1;
-                alpr_response_received = true; // [修复] 通知RFID线程，让其解除阻塞
+                // [FIX] 设置标志和发送信号必须是原子操作，并修复此处缺失信号的问题
+                pthread_mutex_lock(&alpr_mutex);
+                alpr_response_received = true;
+                pthread_cond_signal(&alpr_cond);
+                pthread_mutex_unlock(&alpr_mutex);
                 continue;
             }
 
@@ -198,7 +266,11 @@ void *fun_sqlite(void *arg)
             if (is_car_in_db(carplate)) {
                 printf("车辆 %s 已在库，入库操作忽略。\n", carplate);
                 play_audio("audio/car_already_in.wav"); // 可选
-                alpr_response_received = true; // [修复] 通知RFID线程，让其解除阻塞
+                // [FIX] 设置标志和发送信号必须是原子操作
+                pthread_mutex_lock(&alpr_mutex);
+                alpr_response_received = true;
+                pthread_cond_signal(&alpr_cond);
+                pthread_mutex_unlock(&alpr_mutex);
                 continue;
             }
             // 车辆不在库，执行入库流程
@@ -215,10 +287,24 @@ void *fun_sqlite(void *arg)
                 play_audio("audio/car_in_success.wav");
             }
 
+            // [FIX 1/2] 无论入库流程的结果如何，都在最后统一重置RFID联动标志
+            // 将零散的重置逻辑统一到这里，确保覆盖所有分支（成功、失败、已在库）
+            pthread_mutex_lock(&photo_mutex);
+            if (g_is_rfid_triggered) {
+                g_is_rfid_triggered = false;
+                printf("[DEBUG] RFID联动标志已重置\n");
+            }
+            pthread_mutex_unlock(&photo_mutex);
+
             // 无论出入库，都显示一下当前车库情况
             first = true; // 允许下次打印表格头
             sqlite3_exec(db, "SELECT * FROM info;", showDB, NULL, &err);
+            
+            // [FIX 2/2] 原有的信号发送逻辑保持不变
+            pthread_mutex_lock(&alpr_mutex);
             alpr_response_received = true; // 设置响应标志
+            pthread_cond_signal(&alpr_cond);
+            pthread_mutex_unlock(&alpr_mutex);
         }
 
         // ======== 处理手动出库请求(此逻辑保留，以防万一) ========

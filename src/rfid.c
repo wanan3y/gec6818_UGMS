@@ -40,6 +40,11 @@ void init_tty(void)
 	// 清空输入/输出缓冲区
 	tcflush (tty_fd, TCIOFLUSH);
 
+	// 将串口设置为非阻塞状态，避免第一次运行卡住的情况
+	long state = fcntl(tty_fd, F_GETFL);
+	state |= O_NONBLOCK;
+	fcntl(tty_fd, F_SETFL, state);
+
 	//激活串口设置
 	if(tcsetattr(tty_fd, TCSANOW, &config) != 0)
 	{
@@ -56,7 +61,7 @@ void request_card(int fd)
 	while(1)
 	{
 		// 向串口发送指令
-		tcflush(fd, TCIFLUSH);
+		tcflush(fd, TCIFLUSH); // 改回 TCIFLUSH
 
 		//发送请求指令
 		write(fd, PiccRequest_IDLE, PiccRequest_IDLE[0]);
@@ -64,8 +69,14 @@ void request_card(int fd)
 		usleep(50*1000);
 
 		bzero(recvinfo, 128);
-		if(read(fd, recvinfo, 128) == -1)
-			continue;
+		int bytes_read = read(fd, recvinfo, 128);
+		if(bytes_read == -1) {
+            // perror("request_card read error"); // 调试时可以打开
+            continue;
+        } else if (bytes_read < 3) { // 确保至少读取到状态字节
+            // printf("request_card: Not enough bytes read (%d)\n", bytes_read); // 调试时可以打开
+            continue;
+        }
 
 		//应答帧状态部分为0 则请求成功
 		if(recvinfo[2] == 0x00)	
@@ -81,7 +92,7 @@ void request_card(int fd)
 int get_id(int fd)
 {
 	// 刷新串口缓冲区
-	tcflush (fd, TCIFLUSH);
+	tcflush (fd, TCIFLUSH); // 改回 TCIFLUSH
 
 	// 初始化获取ID指令并发送给读卡器
 	init_ANTICOLL();
@@ -94,7 +105,15 @@ int get_id(int fd)
 	// 获取读卡器的返回值
 	char info[256];
 	bzero(info, 256);
-	read(fd, info, 128);
+	int bytes_read = read(fd, info, 128);
+	
+	if(bytes_read == -1) {
+		// perror("get_id read error"); // 调试时可以打开
+		return -1;
+	} else if (bytes_read < 5) { // 至少需要5字节：帧长度(1) + 命令类型(1) + 状态(1) + 长度(1) + ID(至少1)
+        // printf("get_id: Not enough bytes read (%d)\n", bytes_read); // 调试时可以打开
+        return -1;
+    }
 
 	// 应答帧状态部分为0 则成功
 	uint32_t id = 0;
@@ -130,7 +149,7 @@ int get_cardid(void)
     printf("RFID卡号: %x\n", cardid);
     
     // 简单延时，防止立即重复读取
-    sleep(1);
+    // sleep(1); // [FIX] 删除此行代码，它会导致读卡线程阻塞，错过下一次读卡
 
     return cardid;       // 将获取到的卡号返回
 }

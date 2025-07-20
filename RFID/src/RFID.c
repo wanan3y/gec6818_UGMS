@@ -56,12 +56,22 @@ void TTY_init(void)
 	return;
 }
 
-//不断发送A指令（请求RFID卡），一旦探测到卡片就退出
+//发送A指令（请求RFID卡），添加超时机制和最大尝试次数，避免无限循环
 void request_card(int fd)
 {
 	init_REQUEST();
 	char recvinfo[128];
-	while(1)
+	
+	// 添加超时机制和最大尝试次数
+	const int MAX_ATTEMPTS = 50;  // 最大尝试次数
+	const int TIMEOUT_MS = 5000;  // 总超时时间(毫秒)
+	int attempts = 0;
+	struct timeval start_time, current_time;
+	long elapsed_ms = 0;
+	
+	gettimeofday(&start_time, NULL);
+	
+	while(attempts < MAX_ATTEMPTS && elapsed_ms < TIMEOUT_MS)
 	{
 		// 向串口发送指令
 		tcflush(fd, TCIFLUSH);
@@ -69,20 +79,40 @@ void request_card(int fd)
 		//发送请求指令
 		write(fd, PiccRequest_IDLE, PiccRequest_IDLE[0]);
 
-		usleep(50*1000);
+		usleep(50*1000);  // 50ms延时
 
 		bzero(recvinfo, 128);
 		if(read(fd, recvinfo, 128) == -1)
+		{
+			attempts++;
+			
+			// 计算已经过去的时间
+			gettimeofday(&current_time, NULL);
+			elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 + 
+						 (current_time.tv_usec - start_time.tv_usec) / 1000;
+			
 			continue;
+		}
 
 		//应答帧状态部分为0 则请求成功
 		if(recvinfo[2] == 0x00)	
 		{
 			cardOn = true;
-			break;
+			return;  // 成功检测到卡片，直接返回
 		}
+		
+		attempts++;
 		cardOn = false;
+		
+		// 计算已经过去的时间
+		gettimeofday(&current_time, NULL);
+		elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000 + 
+					 (current_time.tv_usec - start_time.tv_usec) / 1000;
 	}
+	
+	// 如果达到最大尝试次数或超时，设置cardOn为false并返回
+	cardOn = false;
+	printf("RFID读卡超时或达到最大尝试次数\n");
 }
 
 //获取RFID卡号
@@ -126,22 +156,52 @@ void TTY_close(void)
 	close(tty_fd);
 }
 
-// 用户获取rfid卡号
+// 用户获取rfid卡号，添加错误处理和恢复机制
 int get_cardid(void)
 {
 	int cardid = 0;
+	static int error_count = 0;
+	const int MAX_ERRORS = 5;  // 最大连续错误次数
+	
 	printf("waiting card......\n");
 
 	//1、检测附近是否有卡片
 	request_card(tty_fd);
+	
+	// 如果request_card超时或达到最大尝试次数，cardOn会被设置为false
+	if (!cardOn) {
+		error_count++;
+		if (error_count >= MAX_ERRORS) {
+			printf("RFID读卡连续失败%d次，尝试重置设备...\n", error_count);
+			// 尝试重置设备
+			close(tty_fd);
+			usleep(100*1000);  // 等待100ms
+			TTY_init();  // 重新初始化串口
+			error_count = 0;  // 重置错误计数
+		}
+		return -1;
+	}
 
 	//2、获取卡号
 	cardid = get_id(tty_fd);
 
 	// 忽略非法卡号
-	if(cardid == 0 || cardid == 0xFFFFFFFF)
+	if(cardid == 0 || cardid == 0xFFFFFFFF) {
+		error_count++;
+		if (error_count >= MAX_ERRORS) {
+			printf("RFID读卡连续失败%d次，尝试重置设备...\n", error_count);
+			// 尝试重置设备
+			close(tty_fd);
+			usleep(100*1000);  // 等待100ms
+			TTY_init();  // 重新初始化串口
+			error_count = 0;  // 重置错误计数
+		}
 		return -1;
+	}
 
+	// 成功读取卡号，重置错误计数
+	error_count = 0;
+	
 	printf("RFID卡号: %x\n", cardid);
 	return cardid;		// 将获取到的卡号返回
 }
