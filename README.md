@@ -1,4 +1,5 @@
-# 粤嵌 GEC6818：智能车库管理系统 2025年暑假西南财经大学天府学院实训项目
+# 粤嵌 GEC6818：智能车库管理系统 
+2025年暑假西南财经大学天府学院实训项目
 # 无人车库进出管理系统
 ![语言](https://img.shields.io/badge/language-C%2FC%2B%2B-blue.svg)
 ![框架](https://img.shields.io/badge/framework-OpenCV%20%7C%20Caffe-orange.svg)
